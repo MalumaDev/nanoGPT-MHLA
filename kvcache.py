@@ -9,6 +9,7 @@ from typing import Tuple
 import torch
 from torch import nn
 
+
 class KVCache(nn.Module):
     """
     Standalone ``nn.Module`` containing a kv-cache to cache past key and values during inference.
@@ -16,8 +17,8 @@ class KVCache(nn.Module):
     Args:
         batch_size (int): batch size model will be run with
         max_seq_len (int): maximum sequence length model will be run with
-        num_kv_heads (int): number of key/value heads.
-        head_dim (int): per-attention head embedding dimension
+        head_dim (int): ckv embedding dimension
+        rope_dim (int): rope embedding dimension
         dtype (torch.dtype): dtype for the caches
     """
 
@@ -25,17 +26,16 @@ class KVCache(nn.Module):
         self,
         batch_size: int,
         max_seq_len: int,
-        num_heads: int,
         head_dim: int,
         rope_dim: int,
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
         self.register_buffer(
-            "kv_cache", torch.zeros((batch_size, num_heads, max_seq_len, head_dim), dtype=dtype), persistent=False
+            "kv_cache", torch.zeros((batch_size, max_seq_len, head_dim), dtype=dtype), persistent=False
         )
         self.register_buffer(
-            "kr_cache", torch.zeros((batch_size, 1, max_seq_len, rope_dim), dtype=dtype), persistent=False
+            "kr_cache", torch.zeros((batch_size, max_seq_len, rope_dim), dtype=dtype), persistent=False
         )
         self.register_buffer(
             "cache_pos", torch.arange(0, max_seq_len), persistent=False
@@ -47,7 +47,6 @@ class KVCache(nn.Module):
         self.kv_cache.zero_()
         self.kr_cache.zero_()
         self.cache_pos -= self.size
-
 
     @property
     def size(self) -> int:
@@ -88,19 +87,19 @@ class KVCache(nn.Module):
             ValueError: if the batch size of the new key (or value) tensor is greater than the batch size
                 used during cache setup.
         """
-        bsz, _, seq_len, _ = k_val.shape
+        bsz, seq_len, _ = k_val.shape
         if bsz > self.kv_cache.shape[0]:
             raise ValueError(
                 f"The current cache has been setup with a batch size of {self.k_cache.shape[0]}"
                 f", but found new key tensors with batch size {k_val.shape[0]}!"
             )
 
-        assert (self.cache_pos[0] + seq_len) <= self.kv_cache.shape[2]
+        assert (self.cache_pos[0] + seq_len) <= self.kv_cache.shape[1]
         k_out = self.kv_cache
         v_out = self.kr_cache
 
-        k_out[:, :, self.cache_pos[:seq_len]] = k_val
-        v_out[:, :, self.cache_pos[:seq_len]] = v_val
+        k_out[:,  self.cache_pos[:seq_len]] = k_val
+        v_out[:,  self.cache_pos[:seq_len]] = v_val
 
         # forward cache_pos seq_len positions along
         # cache_pos starts at (0, 1, 2, 3, 4, 5, ...)
@@ -111,4 +110,4 @@ class KVCache(nn.Module):
         # e.g. relying on an int size tracker, or re-creating cache_pos every time
         self.cache_pos += seq_len
 
-        return k_out[:,:, :self.cache_pos[0]], v_out[:,:, :self.cache_pos[0]]
+        return k_out[:,  :self.cache_pos[0]], v_out[:, :self.cache_pos[0]]

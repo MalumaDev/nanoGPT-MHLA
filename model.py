@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from kvcache import KVCache
 from rotary_embedding_torch.rotary_embedding_torch import RotaryEmbedding
 
 
@@ -46,9 +47,8 @@ class GPTConfig:
     cq_dim: int = 256
     rope_dim: int = 8
     norm_compressed: bool = True
-
-
-    
+    use_cache: bool = True
+    dtype: torch.dtype = None
 
 
 class MultiHeadLatentAttention(nn.Module):
@@ -57,9 +57,10 @@ class MultiHeadLatentAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # ckv, cq, kr
-        self.c_dims = [config.ckv_dim, config.cq_dim, config.rope_dim]
+        self.c_dims = [config.ckv_dim, config.rope_dim]
         self.c_attn = nn.Linear(config.n_embd, sum(
             self.c_dims), bias=config.bias)
+        self.w_qc = nn.Linear(config.n_embd, config.cq_dim, bias=config.bias)
         # self.w_qr = nn.Linear(config.cq_dim, config.rope_dim * config.n_head, bias=config.bias)
         # self.w_uq = nn.Linear(config.cq_dim , config.n_embd, bias=config.bias)
         self.q_dims = [config.n_embd, config.rope_dim * config.n_head]
@@ -67,9 +68,11 @@ class MultiHeadLatentAttention(nn.Module):
 
         self.w_ukv = nn.Linear(config.ckv_dim, 2 *
                                config.n_embd, bias=config.bias)
-        
-        self.norm_ckv = nn.RMSNorm(config.ckv_dim) if config.norm_compressed else nn.Identity()
-        self.norm_cq = nn.RMSNorm(config.cq_dim) if config.norm_compressed else nn.Identity()
+
+        self.norm_ckv = nn.RMSNorm(
+            sum(self.c_dims)) if config.norm_compressed else nn.Identity()
+        self.norm_cq = nn.RMSNorm(
+            config.cq_dim) if config.norm_compressed else nn.Identity()
 
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -79,7 +82,13 @@ class MultiHeadLatentAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        
+
+        self.cache = None
+        self.dtype = config.dtype
+
+        self.use_cache = config.use_cache
+
+        self.block_size = config.block_size
 
         self.rope = RotaryEmbedding(dim=config.rope_dim)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
@@ -95,19 +104,30 @@ class MultiHeadLatentAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query and key&values compressed
-        ckv, cq, kr = self.c_attn(x).split(self.c_dims, dim=-1)
+        # Use cache
+        if not self.training and self.use_cache:
+            if self.cache is None:
+                self.cache = KVCache(
+                    B, self.block_size, self.c_dims[0], self.c_dims[1], x.dtype if self.dtype is None else self.dtype)
+                self.cache.to(x.device)
 
-        # norm compressed ckv and cq
-        ckv = self.norm_ckv(ckv)
-        cq = self.norm_cq(cq)
+            ckv, kr = self.norm_ckv(self.c_attn(
+                x[:, self.cache.size:])).split(self.c_dims, dim=-1)
+            kr = self.rope.rotate_queries_or_keys(kr)
+            ckv, kr = self.cache.update(ckv, kr)
+        else:
+            # calculate key&values compressed and norm
+            ckv, kr = self.norm_ckv(self.c_attn(x)).split(self.c_dims, dim=-1)
+            kr = self.rope.rotate_queries_or_keys(kr)
+
+        # Compress query and norm
+        cq = self.norm_cq(self.w_qc(x))
 
         # Decopress query and query for rope
         qc, qr = self.w_q(cq).split(self.q_dims, dim=-1)
 
         # Apply rope
         qr = self.rope.rotate_queries_or_keys(qr)
-        kr = self.rope.rotate_queries_or_keys(kr)
 
         kc, vc = self.w_ukv(ckv).chunk(2, dim=-1)  # decompress key and value
 
